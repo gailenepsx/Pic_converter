@@ -1,54 +1,18 @@
-Here are the updated configurations and the **Component 1 (`01_ingestion.py`)** script to reflect your new data constraints. 
+Here is the updated **Component 1 (`01_ingestion.py`)** script. 
 
-To ensure the downstream exceptions module (`03_exceptions.py`) continues to work without needing any rewrites, I have added a column mapping for the whitelist fields (converting `ENTITY_KEY` to `ID` and `ACC_A`, and `ENTITY_KEY2` to `ACC_B`).
+I have implemented all three of your requested adjustments:
+1.  **Empty DataFrame Check:** The script now checks `if not df_temp.empty:` before appending to `df_list`. I also added a safeguard to exit gracefully if all read files happen to be empty.
+2.  **Regex Update:** The regex for the date extraction now uses `r'CM_' + re.escape(target_bu) + r'_PAYMENTS_V8_(\d{8})\.csv'` to safely match the exact BU string.
+3.  **Simplified Whitelist Ingestion:** Removed the sorting logic. Since there is only one file per BU, it directly assigns `wl_path = wl_files`.
 
-### 1. Updated Configuration (`config.json`)
-I have added an `execution_scope` object to define the `target_BU`. This parameter will be used dynamically to locate both the correct payments folders and the specific BU whitelist file.
-
-```json
-{
-    "paths": {
-        "raw_dir": "data/raw/",
-        "parquet_dir": "data/parquet/",
-        "output_dir": "outputs/",
-        "log_file": "simulator.log"
-    },
-    "execution_scope": {
-        "target_BU": "SG" 
-    },
-    "date_ranges": {
-        "data_start_date": "20230101",
-        "data_end_date": "20230131",
-        "test_start_date": "20230115",
-        "test_end_date": "20230131"
-    },
-    "model_parameters": {
-        "TRANS_TYPE": "EFT-ALL",
-        "MIN_VALUE_REF": 1000.0,
-        "PARAM_105": 3,
-        "PARAM_80": 3,
-        "OFFSET": 0,
-        "IGNORE_DECIMALS": 1,
-        "IGNORE_DIGIT_5": 1,
-        "D_DAYS": 14,
-        "MIN_OCCURRENCES": 3
-    },
-    "scoring_scales": {
-        "SCALE_1": [{"min": 10, "score": 80}, {"min": 5, "score": 40}, {"min": 3, "score": 30}],
-        "SCALE_2": [{"min": 100000, "score": 80}, {"min": 10000, "score": 30}, {"min": 3000, "score": 10}],
-        "SCALE_3": [{"min": 0.50, "score": 30}, {"min": 0.30, "score": 20}, {"min": 0.10, "score": 10}]
-    }
-}
-```
-
-### 2. Component 1: Data Ingestion (`01_ingestion.py`)
-This script now reads only from the `target_BU` directories, uses the `;` separator for the payments CSVs, and uses Pandas' `read_excel` to parse the specific "Lists" sheet from the BU's whitelist `.xlsx` file.
+### Updated Component 1 (`01_ingestion.py`)
 
 ```python
 import pandas as pd
 import os
 import glob
 import re
+import sys
 from utils import load_config, get_logger
 
 logger = get_logger("01_Ingestion")
@@ -70,16 +34,17 @@ def run():
         # ==========================================
         # 1. INGEST PAYMENTS (CSV)
         # ==========================================
-        # Dynamically locate CSV files matching the target BU and directory pattern
-        # Pattern: data/raw/[YYYY]/V8/[BU]/Payments/CM_[BU]_PAYMENTS_V8_[YYYYMMDD].csv
         search_pattern = os.path.join(raw_dir, "*", "V8", target_bu, "Payments", f"CM_{target_bu}_PAYMENTS_V8_*.csv")
         all_files = glob.glob(search_pattern)
         
         valid_files = []
+        # Adjusted regex using re.escape as requested
+        regex_pattern = r'CM_' + re.escape(target_bu) + r'_PAYMENTS_V8_(\d{8})\.csv'
+        
         for file_path in all_files:
             filename = os.path.basename(file_path)
-            # Extract the 8-digit date using regex
-            match = re.search(r'CM_.*_PAYMENTS_V8_(\d{8})\.csv', filename)
+            match = re.search(regex_pattern, filename)
+            
             if match:
                 file_date = match.group(1)
                 # Filter files based on the requested Data Date Range
@@ -88,7 +53,6 @@ def run():
         
         if not valid_files:
             logger.error(f"No CSV payment files found for BU {target_bu} in range ({data_start} to {data_end}).")
-            import sys
             sys.exit(1)
             
         logger.info(f"Found {len(valid_files)} payment files to ingest.")
@@ -116,12 +80,20 @@ def run():
             'BU': 'category'
         }
         
-        # Iteratively load and concatenate using the ';' separator
+        # Iteratively load and concatenate using the ';' separator, avoiding empty dataframes
         df_list = []
         for file in valid_files:
             logger.info(f"Reading: {os.path.basename(file)}")
             df_temp = pd.read_csv(file, usecols=csv_columns, dtype=dtypes, sep=';')
-            df_list.append(df_temp)
+            
+            if not df_temp.empty:
+                df_list.append(df_temp)
+            else:
+                logger.warning(f"File {os.path.basename(file)} is empty. Skipping.")
+        
+        if not df_list:
+            logger.error("All valid files read were empty. Stopping ingestion.")
+            sys.exit(1)
             
         df_tx = pd.concat(df_list, ignore_index=True)
         logger.info(f"Concatenated {len(df_tx)} total transactions.")
@@ -148,29 +120,24 @@ def run():
         # ==========================================
         # 2. INGEST WHITELISTS (XLSX)
         # ==========================================
-        # Pattern: CIB ITO FS - SAM8R [BU] RAW Parameters - [YYMMDD].xlsx
         wl_pattern = os.path.join(raw_dir, f"CIB ITO FS - SAM8R {target_bu} RAW Parameters - *.xlsx")
         wl_files = glob.glob(wl_pattern)
         
         if wl_files:
-            # Sort to ensure we pick the latest one if multiple exist
-            wl_files.sort(reverse=True)
+            # Simply take the first matching file since there is only 1 whitelist per BU
             wl_path = wl_files
             logger.info(f"Found Whitelist file: {os.path.basename(wl_path)}")
             
-            # Read only the target columns from the "Lists" sheet
             wl_columns = ["LIST_ID", "ENTITY_KEY", "ENTITY_KEY2"]
             df_wl = pd.read_excel(wl_path, sheet_name="Lists", usecols=wl_columns, engine='openpyxl')
             
-            # Map columns to the expected Data Bus format for Component 3 (Exceptions)
             wl_rename_mapping = {
                 "LIST_ID": "LIST_TYPE",
-                "ENTITY_KEY": "ID",         # Primary mapped field for account whitelists
-                "ENTITY_KEY2": "ACC_B"      # Opposite account for relations
+                "ENTITY_KEY": "ID",         
+                "ENTITY_KEY2": "ACC_B"      
             }
             df_wl.rename(columns=wl_rename_mapping, inplace=True)
             
-            # Duplicate ID into ACC_A so relation whitelist checks in component 3 work flawlessly
             if "ID" in df_wl.columns:
                 df_wl['ACC_A'] = df_wl['ID']
             
@@ -183,15 +150,8 @@ def run():
         
     except Exception as e:
         logger.error(f"Failed during ingestion: {str(e)}", exc_info=True)
-        import sys
         sys.exit(1)
 
 if __name__ == "__main__":
     run()
-```
-
-**Important Execution Note:**
-Because the script now reads `.xlsx` files using Pandas, you must ensure the `openpyxl` engine is installed in your Python environment before running step 01. You can install it via:
-```bash
-pip install openpyxl
 ```
