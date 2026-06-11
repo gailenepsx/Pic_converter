@@ -1,109 +1,138 @@
-Here is the script for **Component 3: Exceptions Filtering (`03_exceptions.py`)**. 
+Here is the script for **Component 4: Round Amount Flagging (`04_round_flagging.py`)**. 
 
-Based on the Actimize model specifications [1], this module explicitly filters out transactions if the account is present in the **Model White List (`BNP-RND-EX-01`)**, an **Account White List**, or if the transaction occurs between two accounts listed in the **Relation White List (`AML-REL-EX-04`)** (evaluating in both directions: A $\rightarrow$ B or B $\rightarrow$ A) [1].
+This module implements the exact mathematical logic specified by the Actimize BNP-RND model to determine if a transaction is a "round amount" [1, 2]. It incorporates robust error handling, efficiently checks for required input files, and safely manages empty dataframes to prevent pipeline crashes.
 
-I have incorporated robust error handling, missing file checks, and optimized Pandas boolean masking to ensure high performance.
-
-### Component 3: Exceptions Filtering (`03_exceptions.py`)
+### Component 4: Round Amount Flagging (`04_round_flagging.py`)
 
 ```python
 import pandas as pd
+import numpy as np
 import os
 import sys
+import json
 from utils import load_config, get_logger
 
-logger = get_logger("03_Exceptions")
+logger = get_logger("04_Flagging")
+
+def vectorize_round_check(amount_series, zeroes, ignore_decimals, ignore_digit_5):
+    """
+    High-performance vectorization of the Actimize Round Amount Formula.
+    Uses mathematical modulo operations to detect trailing zeroes, aligning 
+    with the model's 'INT(Amount) NOT 0' and modulo logic.
+    """
+    # Use absolute amount to handle credits/debits uniformly
+    abs_amt = np.abs(amount_series)
+    
+    # Apply IGNORE DECIMALS rule
+    if ignore_decimals == 1:
+        abs_amt = np.floor(abs_amt)
+        
+    # Condition: INT(Amount) NOT 0
+    valid_int = np.floor(abs_amt) != 0
+    
+    # Calculate Modulo against 10^Z
+    divisor = 10.0 ** zeroes
+    remainder = abs_amt % divisor
+    
+    # Condition 1: Pure Round (remainder is 0)
+    is_round = valid_int & (remainder == 0)
+    
+    # Condition 2: Apply IGNORE DIGIT 5 rule
+    if ignore_digit_5 == 1:
+        # e.g., if Z=3, the remainder must be exactly 500
+        digit_5_value = 5.0 * (10.0 ** (zeroes - 1))
+        is_digit_5_round = valid_int & (remainder == digit_5_value)
+        is_round = is_round | is_digit_5_round
+        
+    return is_round
 
 def run():
     config = load_config()
     pq_dir = config['paths']['parquet_dir']
+    params = config['model_parameters']
     
     try:
-        logger.info("Starting Exceptions Filtering.")
-        tx_path = os.path.join(pq_dir, "transactions.parquet")
-        wl_path = os.path.join(pq_dir, "whitelists.parquet")
+        logger.info("Starting Round Amount Flagging component.")
+        tx_path = os.path.join(pq_dir, "filtered_transactions.parquet")
+        threshold_path = os.path.join(pq_dir, "computed_thresholds.json")
         
         # ---------------------------------------------------------
-        # Error Handling: Check if input transactions exist
+        # Error Handling: Check if inputs exist
         # ---------------------------------------------------------
         if not os.path.exists(tx_path):
-            logger.error(f"Critical Error: Input file not found at {tx_path}. Cannot proceed.")
+            logger.error(f"Critical Error: {tx_path} not found. Ensure Component 03 ran successfully.")
             sys.exit(1)
             
-        df_tx = pd.read_parquet(tx_path)
-        initial_count = len(df_tx)
-        logger.info(f"Loaded {initial_count} transactions for filtering.")
+        if not os.path.exists(threshold_path):
+            logger.error(f"Critical Error: {threshold_path} not found. Ensure Component 02 ran successfully.")
+            sys.exit(1)
+            
+        # Load data and global thresholds
+        df = pd.read_parquet(tx_path)
+        with open(threshold_path, 'r') as f:
+            target_zeroes = json.load(f)["GLOBAL_TARGET_ZEROES"]
+            
+        logger.info(f"Loaded {len(df)} transactions. Applying global target zeroes: {target_zeroes}.")
         
         # ---------------------------------------------------------
-        # Error Handling: Check if whitelists exist
+        # Pre-Filtering based on Model Rules
         # ---------------------------------------------------------
-        if not os.path.exists(wl_path):
-            logger.warning(f"Whitelist file not found at {wl_path}. Bypassing exception filtering.")
-            # Still save the file so Component 4 can pick it up uninterrupted
-            df_tx.to_parquet(os.path.join(pq_dir, "filtered_transactions.parquet"), engine='pyarrow')
+        # Rule (1): Transactions of APP Transaction Type = TRANS TYPE
+        initial_count = len(df)
+        df = df[df['APP_TRANSACTION_TYPE'] == params['TRANS_TYPE']]
+        logger.info(f"Filtered out {initial_count - len(df)} transactions not matching TRANS_TYPE '{params['TRANS_TYPE']}'.")
+        
+        # Rule (2): Transaction value >= MIN VALUE (Evaluated on Reference Currency / Main Currency)
+        current_count = len(df)
+        df = df[df['MAIN_CURRENCY_AMT'] >= params['MIN_VALUE_REF']]
+        logger.info(f"Filtered out {current_count - len(df)} transactions below MIN_VALUE_REF of {params['MIN_VALUE_REF']}.")
+        
+        # Early exit if no transactions remain after filtering
+        if df.empty:
+            logger.warning("No transactions remaining after TRANS_TYPE and MIN_VALUE filters. Generating empty flagged output.")
+            df['IS_ROUND'] = False
+            df.to_parquet(os.path.join(pq_dir, "flagged_transactions.parquet"), engine='pyarrow')
             return
-
-        df_wl = pd.read_parquet(wl_path)
-        
-        # ==========================================
-        # 1. ACCOUNT & MODEL WHITELISTS
-        # ==========================================
-        # Applies Model White List (BNP-RND-EX-01) and generic Account White Lists
-        acc_wl_types = ['ACCOUNT_WHITE_LIST', 'ACCOUNT WHITE LIST', 'BNP-RND-EX-01']
-        
-        # Safely extract IDs, dropping any NaNs to prevent pandas errors
-        account_exemptions = df_wl[df_wl['LIST_TYPE'].isin(acc_wl_types)]['ID'].dropna().unique()
-        
-        if len(account_exemptions) > 0:
-            # Vectorized filtering for performance
-            df_tx = df_tx[~df_tx['ACC_KEY'].isin(account_exemptions)]
-            logger.info(f"Filtered {initial_count - len(df_tx)} transactions due to Account/Model Whitelists.")
-        else:
-            logger.info("No Account or Model Whitelist exemptions found to apply.")
             
-        # ==========================================
-        # 2. RELATION WHITELISTS (Bidirectional A -> B or B -> A)
-        # ==========================================
-        # Applies Relation White List (AML-REL-EX-04)
-        rel_whitelist = df_wl[df_wl['LIST_TYPE'] == 'AML-REL-EX-04'].dropna(subset=['ACC_A', 'ACC_B'])
+        # ---------------------------------------------------------
+        # Actimize Mathematical Flagging Execution
+        # ---------------------------------------------------------
+        logger.info("Executing mathematical flagging on Original and Main currency amounts...")
         
-        if not rel_whitelist.empty:
-            current_count = len(df_tx)
-            
-            # Create a boolean mask initialized to False
-            mask = pd.Series(False, index=df_tx.index)
-            
-            # Build the condition dynamically for each relation pair
-            for _, row in rel_whitelist.iterrows():
-                acc_a = row['ACC_A']
-                acc_b = row['ACC_B']
-                
-                # Condition: (ACC_KEY == A & OPP == B) OR (ACC_KEY == B & OPP == A)
-                cond = ((df_tx['ACC_KEY'] == acc_a) & (df_tx['OPP_ACCOUNT_KEY'] == acc_b)) | \
-                       ((df_tx['ACC_KEY'] == acc_b) & (df_tx['OPP_ACCOUNT_KEY'] == acc_a))
-                
-                # Update the master mask
-                mask = mask | cond
-                
-            # Filter the dataframe to KEEP transactions where the mask is False (not a relation match)
-            df_tx = df_tx[~mask]
-            logger.info(f"Filtered {current_count - len(df_tx)} transactions due to Relation Whitelist (AML-REL-EX-04).")
-        else:
-            logger.info("No Relation Whitelist exemptions found to apply.")
-
-        # ==========================================
-        # 3. OUTPUT GENERATION
-        # ==========================================
-        final_count = len(df_tx)
-        logger.info(f"Exception filtering complete. Total removed: {initial_count - final_count}. Remaining: {final_count}.")
+        # Rule (3) & (4): Transaction value in Original Currency OR Main Currency is round amount
+        flag_orig = vectorize_round_check(
+            df['ORIG_CURRENCY_AMT'], 
+            target_zeroes, 
+            params['IGNORE_DECIMALS'], 
+            params['IGNORE_DIGIT_5']
+        )
         
-        df_tx.to_parquet(os.path.join(pq_dir, "filtered_transactions.parquet"), engine='pyarrow')
-        logger.info("Saved clean data to filtered_transactions.parquet successfully.")
+        flag_main = vectorize_round_check(
+            df['MAIN_CURRENCY_AMT'], 
+            target_zeroes, 
+            params['IGNORE_DECIMALS'], 
+            params['IGNORE_DIGIT_5']
+        )
+        
+        # A transaction is round if either the Original OR the Main currency amount meets the criteria
+        df['IS_ROUND'] = flag_orig | flag_main
+        
+        round_count = df['IS_ROUND'].sum()
+        logger.info(f"Successfully flagged {round_count} round transactions out of {len(df)} eligible transactions.")
+        
+        # Serialize to data bus
+        df.to_parquet(os.path.join(pq_dir, "flagged_transactions.parquet"), engine='pyarrow')
+        logger.info("Flagged dataset serialized to flagged_transactions.parquet.")
         
     except Exception as e:
-        logger.error(f"Failed during exception filtering: {str(e)}", exc_info=True)
+        logger.error(f"Failed during round amount flagging: {str(e)}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
     run()
 ```
+
+### Key Technical Alignments:
+*   **Actimize Logic Implementation:** The `vectorize_round_check` function mathematically replicates the rule formulas presented in the model specifications (`INT(Amount) NOT 0`, extracting trailing zeroes, and handling `IGNORE DECIMALS` and `IGNORE DIGIT 5`) [2].
+*   **Dual Currency Evaluation:** Reflecting the model's detection logic, the script tests both the `ORIG_CURRENCY_AMT` and `MAIN_CURRENCY_AMT` using an `OR` condition (`flag_orig | flag_main`) [3].
+*   **Threshold Application:** It applies the exact `MIN VALUE` filter specifically against the reference currency (`MAIN_CURRENCY_AMT`) prior to evaluating the mathematical roundness [3, 4].
