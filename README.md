@@ -1,10 +1,8 @@
-Here is the script for **Component 5: Observation & Aggregation (`05_aggregation.py`)**.
+The error you encountered happens because newer versions of Pandas strictly enforce numeric operations within the `.rolling().agg()` method. Passing a lambda function to generate a list of strings (`TRANSACTION_KEY`) causes the aggregator to fail with the `must be real number, not list` exception.
 
-This module calculates the sliding 14-day observation window (`D=14`) per client (since the Distribution Level is "Party" [1]). It evaluates if the transactions breach the minimum Recurrence threshold (e.g., $\ge$ 3 occurrences) [2, 3], and calculates the necessary metrics for the three scoring scales [3, 4].
+To fix this efficiently, we must separate the string aggregation from the numeric rolling calculations. A highly optimized way to do this is to perform the numeric `.rolling()` first, filter down to the alerts that breach the threshold, and *then* look up the `TRANSACTION_KEY` list strictly for those specific alert periods. This prevents Pandas from trying to concatenate lists millions of times in the rolling window.
 
-I have also implemented the **Test Date Range filter** here. The system uses the historical data (from `data_start_date`) to accurately build the 14-day rolling window history, but it will only output alerts that actually trigger within your specified `test_start_date` and `test_end_date`.
-
-### Component 5: Aggregation (`05_aggregation.py`)
+Here is the corrected **Component 5 (`05_aggregation.py`)**:
 
 ```python
 import pandas as pd
@@ -48,13 +46,12 @@ def run():
         df = df.sort_values('VALUE_DATE')
         
         # Calculate the round amount volume per transaction
-        # Since IS_ROUND is boolean, multiplying it by the volume zeroes out non-round transactions 
         df['ROUND_VOLUME'] = df['IS_ROUND'] * df['MAIN_CURRENCY_AMT']
         
         # ---------------------------------------------------------
-        # Rolling Window Aggregation (Distribution Level: Party)
+        # Rolling Window Aggregation (Numeric Metrics Only)
         # ---------------------------------------------------------
-        logger.info("Executing rolling window aggregation per CLIENT_NO...")
+        logger.info("Executing numeric rolling window aggregation per CLIENT_NO...")
         
         # Set index to VALUE_DATE for pandas rolling operations
         df_indexed = df.set_index('VALUE_DATE')
@@ -62,12 +59,11 @@ def run():
         # Group by Party (CLIENT_NO) and apply rolling window of D_DAYS
         grouped = df_indexed.groupby('CLIENT_NO')
         
-        # Calculate metrics for SCALE 1, SCALE 2, and SCALE 3
+        # Calculate ONLY numeric metrics to prevent Pandas "must be real number" errors
         rolling_stats = grouped.rolling(f"{params['D_DAYS']}D").agg({
             'IS_ROUND': 'sum',                 # SCALE 1: Number of Occurrences
             'ROUND_VOLUME': 'sum',             # SCALE 2: Total Round Amount Value
-            'MAIN_CURRENCY_AMT': 'sum',        # Total Volume (Used for SCALE 3 Ratio calculation)
-            'TRANSACTION_KEY': lambda x: list(x) # Gather transaction IDs for Audit Trail tracking
+            'MAIN_CURRENCY_AMT': 'sum'         # Total Volume (Used for SCALE 3 Ratio calculation)
         }).reset_index()
         
         # Rename columns for semantic clarity
@@ -76,8 +72,7 @@ def run():
             'MAIN_CURRENCY_AMT': 'TOTAL_VOLUME'
         }, inplace=True)
         
-        # Calculate SCALE 3 Ratio (Total Round Amount Volume / Total Volume)
-        # Fill NaN with 0 to safely handle any potential division by zero
+        # Calculate SCALE 3 Ratio
         rolling_stats['RATIO'] = (rolling_stats['ROUND_VOLUME'] / rolling_stats['TOTAL_VOLUME']).fillna(0)
         
         # ---------------------------------------------------------
@@ -87,7 +82,35 @@ def run():
         alerts = rolling_stats[rolling_stats['OCCURRENCES'] >= params['MIN_OCCURRENCES']].copy()
         logger.info(f"Found {len(alerts)} instances breaching the Recurrence threshold (>= {params['MIN_OCCURRENCES']}).")
         
-        # Filter 2: Execution Scope (Test Date Range)
+        # ---------------------------------------------------------
+        # Separately Compute TRANSACTION_KEY list for Alerts
+        # ---------------------------------------------------------
+        logger.info("Retrieving Transaction IDs specifically for the generated alerts...")
+        
+        def get_tx_keys(row, source_df, d_days):
+            end_date = row['VALUE_DATE']
+            # Pandas rolling D calculates exactly > (end_date - D) and <= end_date
+            start_date = end_date - pd.Timedelta(days=d_days)
+            
+            # Filter the source dataframe for the current client within their specific 14-day window
+            mask = (
+                (source_df['CLIENT_NO'] == row['CLIENT_NO']) &
+                (source_df['VALUE_DATE'] > start_date) &
+                (source_df['VALUE_DATE'] <= end_date)
+            )
+            return source_df.loc[mask, 'TRANSACTION_KEY'].tolist()
+
+        # Apply the helper function only to the filtered alerts to save immense processing time
+        if not alerts.empty:
+            alerts['TRANSACTION_KEY'] = alerts.apply(
+                lambda row: get_tx_keys(row, df, params['D_DAYS']), axis=1
+            )
+        else:
+            alerts['TRANSACTION_KEY'] = []
+            
+        # ---------------------------------------------------------
+        # Test Date Range Filter
+        # ---------------------------------------------------------
         # We only output alerts generated within the requested testing window
         test_start = pd.to_datetime(date_ranges['test_start_date'], format="%Y%m%d")
         test_end = pd.to_datetime(date_ranges['test_end_date'], format="%Y%m%d")
@@ -108,8 +131,3 @@ def run():
 if __name__ == "__main__":
     run()
 ```
-
-### Key Technical Enhancements
-*   **Vectorized Volume Isolation:** Instead of using slow `.apply()` or `lambda` functions, the code isolates the round volume using simple boolean vectorization (`df['IS_ROUND'] * df['MAIN_CURRENCY_AMT']`). This handles thousands of rows in milliseconds.
-*   **Test Date Windowing:** The script leverages the `date_ranges` parameter from `config.json` to filter the *final* alert output. The historical dates prior to `test_start_date` are successfully read to build up the sliding 14-day metrics [1], but are cleanly truncated before the final serialization so you only get test results for the targeted timeframe.
-*   **Division by Zero Safety:** Handled ratio calculations dynamically, using `.fillna(0)` to prevent the script from crashing if an edge case results in a blank volume sum [4].
