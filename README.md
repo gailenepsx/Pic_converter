@@ -1,8 +1,8 @@
-Here is the script for **Component 4: Round Amount Flagging (`04_round_flagging.py`)**. 
+Here is the updated script for **Component 4: Round Amount Flagging (`04_round_flagging.py`)**.
 
-This module implements the exact mathematical logic specified by the Actimize BNP-RND model to determine if a transaction is a "round amount" [1, 2]. It incorporates robust error handling, efficiently checks for required input files, and safely manages empty dataframes to prevent pipeline crashes.
+Based on your instructions, I have modified the script to completely remove the `TRANS_TYPE` pre-filter (Rule 1) and isolated the mathematical round amount evaluation to only check the **Original Currency** (`ORIG_CURRENCY_AMT`), removing the `OR` condition for the Main Currency.
 
-### Component 4: Round Amount Flagging (`04_round_flagging.py`)
+### Updated Component 4: Round Amount Flagging (`04_round_flagging.py`)
 
 ```python
 import pandas as pd
@@ -17,8 +17,7 @@ logger = get_logger("04_Flagging")
 def vectorize_round_check(amount_series, zeroes, ignore_decimals, ignore_digit_5):
     """
     High-performance vectorization of the Actimize Round Amount Formula.
-    Uses mathematical modulo operations to detect trailing zeroes, aligning 
-    with the model's 'INT(Amount) NOT 0' and modulo logic.
+    Uses mathematical modulo operations to detect trailing zeroes.
     """
     # Use absolute amount to handle credits/debits uniformly
     abs_amt = np.abs(amount_series)
@@ -77,10 +76,7 @@ def run():
         # ---------------------------------------------------------
         # Pre-Filtering based on Model Rules
         # ---------------------------------------------------------
-        # Rule (1): Transactions of APP Transaction Type = TRANS TYPE
-        initial_count = len(df)
-        df = df[df['APP_TRANSACTION_TYPE'] == params['TRANS_TYPE']]
-        logger.info(f"Filtered out {initial_count - len(df)} transactions not matching TRANS_TYPE '{params['TRANS_TYPE']}'.")
+        # Rule (1) [REMOVED]: Filtering by APP_TRANSACTION_TYPE == TRANS_TYPE has been removed per instructions.
         
         # Rule (2): Transaction value >= MIN VALUE (Evaluated on Reference Currency / Main Currency)
         current_count = len(df)
@@ -89,7 +85,7 @@ def run():
         
         # Early exit if no transactions remain after filtering
         if df.empty:
-            logger.warning("No transactions remaining after TRANS_TYPE and MIN_VALUE filters. Generating empty flagged output.")
+            logger.warning("No transactions remaining after MIN_VALUE filter. Generating empty flagged output.")
             df['IS_ROUND'] = False
             df.to_parquet(os.path.join(pq_dir, "flagged_transactions.parquet"), engine='pyarrow')
             return
@@ -97,25 +93,16 @@ def run():
         # ---------------------------------------------------------
         # Actimize Mathematical Flagging Execution
         # ---------------------------------------------------------
-        logger.info("Executing mathematical flagging on Original and Main currency amounts...")
+        logger.info("Executing mathematical flagging exclusively on Original Currency amounts...")
         
-        # Rule (3) & (4): Transaction value in Original Currency OR Main Currency is round amount
-        flag_orig = vectorize_round_check(
+        # Rule (3) ONLY: Transaction value in Original Currency is round amount.
+        # Rule (4) [Main Currency check] has been removed per instructions.
+        df['IS_ROUND'] = vectorize_round_check(
             df['ORIG_CURRENCY_AMT'], 
             target_zeroes, 
             params['IGNORE_DECIMALS'], 
             params['IGNORE_DIGIT_5']
         )
-        
-        flag_main = vectorize_round_check(
-            df['MAIN_CURRENCY_AMT'], 
-            target_zeroes, 
-            params['IGNORE_DECIMALS'], 
-            params['IGNORE_DIGIT_5']
-        )
-        
-        # A transaction is round if either the Original OR the Main currency amount meets the criteria
-        df['IS_ROUND'] = flag_orig | flag_main
         
         round_count = df['IS_ROUND'].sum()
         logger.info(f"Successfully flagged {round_count} round transactions out of {len(df)} eligible transactions.")
@@ -132,7 +119,7 @@ if __name__ == "__main__":
     run()
 ```
 
-### Key Technical Alignments:
-*   **Actimize Logic Implementation:** The `vectorize_round_check` function mathematically replicates the rule formulas presented in the model specifications (`INT(Amount) NOT 0`, extracting trailing zeroes, and handling `IGNORE DECIMALS` and `IGNORE DIGIT 5`) [2].
-*   **Dual Currency Evaluation:** Reflecting the model's detection logic, the script tests both the `ORIG_CURRENCY_AMT` and `MAIN_CURRENCY_AMT` using an `OR` condition (`flag_orig | flag_main`) [3].
-*   **Threshold Application:** It applies the exact `MIN VALUE` filter specifically against the reference currency (`MAIN_CURRENCY_AMT`) prior to evaluating the mathematical roundness [3, 4].
+### Key Adjustments Implemented:
+*   **Rule 1 Removed:** The snippet `df = df[df['APP_TRANSACTION_TYPE'] == params['TRANS_TYPE']]` and its corresponding log are completely gone. Transactions of any type will now pass through to the next phase, provided they meet the `MIN_VALUE_REF` [1, 2].
+*   **Rule 3 Isolated:** I removed the `flag_main` calculation block. The `IS_ROUND` boolean column is now generated purely by passing the `ORIG_CURRENCY_AMT` through the `vectorize_round_check` function, entirely ignoring `MAIN_CURRENCY_AMT` for roundness detection [1, 2].
+*   **Log Accuracy:** Adjusted the console and logging outputs to accurately reflect that only the MIN VALUE filter and the Original Currency are being evaluated.
