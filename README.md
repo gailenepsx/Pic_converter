@@ -1,157 +1,58 @@
-Here is the updated **Component 1 (`01_ingestion.py`)** script. 
+Here is the script for **Component 2: Configuration & Thresholds (`02_config_prep.py`)**. 
 
-I have implemented all three of your requested adjustments:
-1.  **Empty DataFrame Check:** The script now checks `if not df_temp.empty:` before appending to `df_list`. I also added a safeguard to exit gracefully if all read files happen to be empty.
-2.  **Regex Update:** The regex for the date extraction now uses `r'CM_' + re.escape(target_bu) + r'_PAYMENTS_V8_(\d{8})\.csv'` to safely match the exact BU string.
-3.  **Simplified Whitelist Ingestion:** Removed the sorting logic. Since there is only one file per BU, it directly assigns `wl_path = wl_files`.
+As we discussed earlier, since the `exchange_rates.csv` file has been removed from the architecture, this script no longer needs to map dynamic currencies or use Pandas. Instead, it serves as a lightweight validation step to execute the business logic formula and compute the global static threshold for the target zeroes [1].
 
-### Updated Component 1 (`01_ingestion.py`)
+It applies the model's rule: `MAX(Business parameter #105, Business Logic Parameter 80 + Offset)` [1].
+
+### Component 2: Configuration Prep (`02_config_prep.py`)
 
 ```python
-import pandas as pd
 import os
-import glob
-import re
-import sys
+import json
 from utils import load_config, get_logger
 
-logger = get_logger("01_Ingestion")
+logger = get_logger("02_ConfigPrep")
 
 def run():
     config = load_config()
-    raw_dir = config['paths']['raw_dir']
-    pq_dir = config['paths']['parquet_dir']
+    out_dir = config['paths']['parquet_dir']
     
-    data_start = config['date_ranges']['data_start_date']
-    data_end = config['date_ranges']['data_end_date']
-    target_bu = config['execution_scope']['target_BU']
-    
-    os.makedirs(pq_dir, exist_ok=True)
-
     try:
-        logger.info(f"Starting Data Ingestion for BU: {target_bu}. Data range: {data_start} to {data_end}")
+        logger.info("Starting Configuration & Threshold Preparation.")
         
-        # ==========================================
-        # 1. INGEST PAYMENTS (CSV)
-        # ==========================================
-        search_pattern = os.path.join(raw_dir, "*", "V8", target_bu, "Payments", f"CM_{target_bu}_PAYMENTS_V8_*.csv")
-        all_files = glob.glob(search_pattern)
+        # Extract business logic parameters from config.json
+        param_105 = config['model_parameters']['PARAM_105']
+        offset = config['model_parameters']['OFFSET']
+        param_80 = config['model_parameters']['PARAM_80']
         
-        valid_files = []
-        # Adjusted regex using re.escape as requested
-        regex_pattern = r'CM_' + re.escape(target_bu) + r'_PAYMENTS_V8_(\d{8})\.csv'
+        # Calculate static TARGET_ZEROES fallback since dynamic exchange rates are removed.
+        # Formula: MAX(Parameter #105, Parameter #80 + Offset)
+        target_zeroes = max(param_105, param_80 + offset)
         
-        for file_path in all_files:
-            filename = os.path.basename(file_path)
-            match = re.search(regex_pattern, filename)
-            
-            if match:
-                file_date = match.group(1)
-                # Filter files based on the requested Data Date Range
-                if data_start <= file_date <= data_end:
-                    valid_files.append(file_path)
-        
-        if not valid_files:
-            logger.error(f"No CSV payment files found for BU {target_bu} in range ({data_start} to {data_end}).")
-            sys.exit(1)
-            
-        logger.info(f"Found {len(valid_files)} payment files to ingest.")
-        
-        csv_columns = [
-            "TRANSACTION_KEY", "CLIENTNUM", "CLIENT_NAME", "ACCOUNT_POPULATION_GROUP",
-            "PARTY_POPULATION_GROUP", "ACCOUNT_KEY", "TRANS_TYPE_CD", "TRANSACTION_TYPE_DESC",
-            "DIRECTION", "TRANS_INSERT_DATE", "TRANS_VALUE_DATE", "CONVERTED_AMT",
-            "ORIGINAL_AMOUNT", "ORIGINAL_CURR_CODE", "OPP_COUNTRY_CD", "PAY_OPP_ACCT_KEY", "BU"
-        ]
-        
-        dtypes = {
-            'TRANSACTION_KEY': 'string',
-            'CLIENTNUM': 'string',
-            'CLIENT_NAME': 'string',
-            'ACCOUNT_POPULATION_GROUP': 'category',
-            'PARTY_POPULATION_GROUP': 'category',
-            'ACCOUNT_KEY': 'string',
-            'TRANS_TYPE_CD': 'category',
-            'TRANSACTION_TYPE_DESC': 'category',
-            'DIRECTION': 'category',
-            'ORIGINAL_CURR_CODE': 'category',
-            'OPP_COUNTRY_CD': 'category',
-            'PAY_OPP_ACCT_KEY': 'string',
-            'BU': 'category'
+        # Prepare the computed threshold data
+        threshold_data = {
+            "GLOBAL_TARGET_ZEROES": target_zeroes
         }
         
-        # Iteratively load and concatenate using the ';' separator, avoiding empty dataframes
-        df_list = []
-        for file in valid_files:
-            logger.info(f"Reading: {os.path.basename(file)}")
-            df_temp = pd.read_csv(file, usecols=csv_columns, dtype=dtypes, sep=';')
+        # Save this computed parameter securely as a JSON file 
+        # so it can be picked up by the data bus for Component 04 (Flagging)
+        output_path = os.path.join(out_dir, "computed_thresholds.json")
+        with open(output_path, 'w') as f:
+            json.dump(threshold_data, f)
             
-            if not df_temp.empty:
-                df_list.append(df_temp)
-            else:
-                logger.warning(f"File {os.path.basename(file)} is empty. Skipping.")
-        
-        if not df_list:
-            logger.error("All valid files read were empty. Stopping ingestion.")
-            sys.exit(1)
-            
-        df_tx = pd.concat(df_list, ignore_index=True)
-        logger.info(f"Concatenated {len(df_tx)} total transactions.")
-        
-        # Map to the standardized Parquet data bus schema
-        rename_mapping = {
-            "CLIENTNUM": "CLIENT_NO",
-            "TRANS_TYPE_CD": "APP_TRANSACTION_TYPE",
-            "ORIGINAL_AMOUNT": "ORIG_CURRENCY_AMT",
-            "ORIGINAL_CURR_CODE": "ORIG_CURRENCY_CD",
-            "CONVERTED_AMT": "MAIN_CURRENCY_AMT",
-            "ACCOUNT_KEY": "ACC_KEY",
-            "PAY_OPP_ACCT_KEY": "OPP_ACCOUNT_KEY"
-        }
-        df_tx.rename(columns=rename_mapping, inplace=True)
-        
-        df_tx['VALUE_DATE'] = pd.to_datetime(df_tx['TRANS_VALUE_DATE'])
-        df_tx['ORIG_CURRENCY_AMT'] = df_tx['ORIG_CURRENCY_AMT'].astype(float)
-        df_tx['MAIN_CURRENCY_AMT'] = df_tx['MAIN_CURRENCY_AMT'].astype(float)
-        
-        df_tx.to_parquet(os.path.join(pq_dir, "transactions.parquet"), engine='pyarrow')
-        logger.info("Serialized all transactions to transactions.parquet successfully.")
-
-        # ==========================================
-        # 2. INGEST WHITELISTS (XLSX)
-        # ==========================================
-        wl_pattern = os.path.join(raw_dir, f"CIB ITO FS - SAM8R {target_bu} RAW Parameters - *.xlsx")
-        wl_files = glob.glob(wl_pattern)
-        
-        if wl_files:
-            # Simply take the first matching file since there is only 1 whitelist per BU
-            wl_path = wl_files
-            logger.info(f"Found Whitelist file: {os.path.basename(wl_path)}")
-            
-            wl_columns = ["LIST_ID", "ENTITY_KEY", "ENTITY_KEY2"]
-            df_wl = pd.read_excel(wl_path, sheet_name="Lists", usecols=wl_columns, engine='openpyxl')
-            
-            wl_rename_mapping = {
-                "LIST_ID": "LIST_TYPE",
-                "ENTITY_KEY": "ID",         
-                "ENTITY_KEY2": "ACC_B"      
-            }
-            df_wl.rename(columns=wl_rename_mapping, inplace=True)
-            
-            if "ID" in df_wl.columns:
-                df_wl['ACC_A'] = df_wl['ID']
-            
-            df_wl.to_parquet(os.path.join(pq_dir, "whitelists.parquet"), engine='pyarrow')
-            logger.info("Whitelist serialized successfully to Parquet.")
-        else:
-            logger.warning(f"No Whitelist file found matching pattern for BU {target_bu}. Exceptions filtering will fail or be bypassed.")
-        
-        logger.info("Data Ingestion component completed successfully.")
+        logger.info(f"Global Target Zeroes computed as: {target_zeroes}")
+        logger.info(f"Threshold parameters successfully serialized to {output_path}")
         
     except Exception as e:
-        logger.error(f"Failed during ingestion: {str(e)}", exc_info=True)
+        logger.error(f"Failed during configuration prep: {str(e)}", exc_info=True)
+        import sys
         sys.exit(1)
 
 if __name__ == "__main__":
     run()
 ```
+
+### Key Highlights of this Component:
+* **Business Logic Enforcement:** It strictly calculates the zeroes based on the parameters mapped in the `config.json` file, enforcing the `PARAM_105` minimum floor rule defined in the Actimize documentation [1, 2].
+* **Modular Data Hand-off:** By saving the calculation into `computed_thresholds.json` within the Parquet directory, it safely passes the exact threshold to the downstream `04_round_flagging.py` component without creating tight coupling between the scripts.
+* **Error Handling:** Wraps the file generation in a `try...except` block, ensuring that if there are file permission issues in the output directory, the orchestrator is immediately alerted and halts the pipeline before running the heavier math modules.
