@@ -1,5 +1,7 @@
 The error you encountered happens because newer versions of Pandas strictly enforce numeric operations within the `.rolling().agg()` method. Passing a lambda function to generate a list of strings (`TRANSACTION_KEY`) causes the aggregator to fail with the `must be real number, not list` exception.
 
+=IF(OR(LOWER(A2)="individual",LOWER(A2)="business"),A2,IF(OR(LOWER(B2)="individual",LOWER(B2)="business"),B2,IF(OR(LOWER(D2)="individual",LOWER(D2)="business"),D2,"")))
+
 To fix this efficiently, we must separate the string aggregation from the numeric rolling calculations. A highly optimized way to do this is to perform the numeric `.rolling()` first, filter down to the alerts that breach the threshold, and *then* look up the `TRANSACTION_KEY` list strictly for those specific alert periods. This prevents Pandas from trying to concatenate lists millions of times in the rolling window.
 
 Here is the corrected **Component 5 (`05_aggregation.py`)**:
