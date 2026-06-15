@@ -1,103 +1,109 @@
-I apologize for the formatting cut-off in my previous message. The syntax error happened because the arrays assigning the score values (`val_scale_1`, `val_scale_2`, and `val_scale_3`) were left completely empty.
+You are absolutely right. A complete AML model simulator must separate the outputs into two distinct deliverables: the **Alerts file** (the summarized alert metadata at the Account/Party level) and the **Audit Trail file** (the itemized list of specific transactions that triggered each alert).
 
-Based on the official "Scoring Scales" from the BNP-RND model specifications [1], these are the exact missing values we need to map:
-*   **SCALE 1 (Occurrences):** 10 occurrences = 80 points, 5 occurrences = 40 points, 3 occurrences = 30 points [1].
-*   **SCALE 2 (Total Round Amount Value):** 100,000 = 80 points, 10,000 = 30 points, 3,000 = 10 points [1].
-*   **SCALE 3 (Ratio):** 50% = 30 points, 30% = 20 points, 10% = 10 points [1].
+Here is the complete **Component 7 (`07_output.py`)** script. It takes the `scored_alerts.parquet`, generates a unique `ALERT_ID`, tags the official model metadata [1], and then uses the Pandas `.explode()` function to safely expand your list of transactions into a separate, line-by-line Audit Trail.
 
-Here is the fully corrected and complete **Component 6: Scoring (`06_scoring.py`)** script:
+### Component 7: Output Generation (`07_output.py`)
 
 ```python
 import pandas as pd
-import numpy as np
 import os
 import sys
 from utils import load_config, get_logger
 
-logger = get_logger("06_Scoring")
+logger = get_logger("07_Output")
 
 def run():
     config = load_config()
     pq_dir = config['paths']['parquet_dir']
     
+    # Define an output directory for the final CSV files
+    # (Defaulting to a 'results' folder in the project root)
+    out_dir = config.get('paths', {}).get('output_dir', './results')
+    os.makedirs(out_dir, exist_ok=True)
+    
     try:
-        logger.info("Starting Alert Scoring component.")
-        alerts_path = os.path.join(pq_dir, "aggregated_alerts.parquet")
+        logger.info("Starting Output Generation component.")
+        alerts_path = os.path.join(pq_dir, "scored_alerts.parquet")
         
         # ---------------------------------------------------------
         # Error Handling: Check if input file exists
         # ---------------------------------------------------------
         if not os.path.exists(alerts_path):
-            logger.error(f"Critical Error: {alerts_path} not found. Ensure Component 05 ran successfully.")
+            logger.error(f"Critical Error: {alerts_path} not found. Ensure Component 06 ran successfully.")
             sys.exit(1)
             
         df = pd.read_parquet(alerts_path)
         
         if df.empty:
-            logger.warning("Input alerts dataset is empty. Generating empty scored output.")
-            pd.DataFrame().to_parquet(os.path.join(pq_dir, "scored_alerts.parquet"), engine='pyarrow')
+            logger.warning("No alerts to process. Generating empty output files.")
+            pd.DataFrame().to_csv(os.path.join(out_dir, "alerts_file.csv"), index=False)
+            pd.DataFrame().to_csv(os.path.join(out_dir, "audit_trail_file.csv"), index=False)
             return
             
-        logger.info(f"Loaded {len(df)} alerts for scoring evaluation.")
+        logger.info(f"Loaded {len(df)} scored alerts for formatting.")
         
         # =========================================================
-        # SCALE 1: Number of Occurrences
+        # STEP 1: Model Metadata Enrichment
         # =========================================================
-        # 10+ = 80, 5+ = 40, 3+ = 30
-        cond_scale_1 = [
-            df['OCCURRENCES'] >= 10,
-            df['OCCURRENCES'] >= 5,
-            df['OCCURRENCES'] >= 3
+        # Appending the official model identifiers required for routing
+        df['Rule_Id'] = 'BNP-RND-EFT-ALL-A-S14-SST'
+        df['Alert_Type'] = '10001 [Account Suspicious Activity]'
+        df['Rule_Name'] = 'Round Amount Activity'
+        
+        # Generate a unique ALERT_ID using Client No and the Value Date
+        df['ALERT_ID'] = 'RND_' + df['CLIENT_NO'].astype(str) + '_' + pd.to_datetime(df['VALUE_DATE']).dt.strftime('%Y%m%d')
+        
+        # =========================================================
+        # STEP 2: Generate the Alerts File
+        # =========================================================
+        logger.info("Formatting the Alerts file...")
+        
+        # Select and order the columns for the summarized alerts view
+        alerts_columns = [
+            'ALERT_ID', 'CLIENT_NO', 'ACC_KEY', 'VALUE_DATE', 
+            'OCCURRENCES', 'ROUND_VOLUME', 'TOTAL_VOLUME', 'RATIO', 
+            'SCORE_SCALE_1', 'SCORE_SCALE_2', 'SCORE_SCALE_3', 'TOTAL_SCORE',
+            'Rule_Id', 'Alert_Type', 'Rule_Name'
         ]
-        val_scale_1 = 
-        df['SCORE_SCALE_1'] = np.select(cond_scale_1, val_scale_1, default=0)
+        alerts_file = df[alerts_columns].copy()
         
         # =========================================================
-        # SCALE 2: Total Round Amount Value
+        # STEP 3: Generate the Audit Trail File
         # =========================================================
-        # 100,000+ = 80, 10,000+ = 30, 3,000+ = 10
-        cond_scale_2 = [
-            df['ROUND_VOLUME'] >= 100000,
-            df['ROUND_VOLUME'] >= 10000,
-            df['ROUND_VOLUME'] >= 3000
-        ]
-        val_scale_2 = 
-        df['SCORE_SCALE_2'] = np.select(cond_scale_2, val_scale_2, default=0)
+        logger.info("Exploding transaction lists to generate the itemized Audit Trail file...")
+        
+        # Select the key mapping columns
+        audit_columns = ['ALERT_ID', 'CLIENT_NO', 'ACC_KEY', 'TRANSACTION_KEY']
+        audit_trail_base = df[audit_columns].copy()
+        
+        # Explode the list of transaction IDs so each transaction gets its own row
+        audit_trail_file = audit_trail_base.explode('TRANSACTION_KEY')
+        
+        # Drop any potential empty rows (if a transaction list was missing)
+        audit_trail_file = audit_trail_file.dropna(subset=['TRANSACTION_KEY'])
         
         # =========================================================
-        # SCALE 3: Ratio of Round Amount Volume to Total volume
+        # STEP 4: Export to CSV
         # =========================================================
-        # 50%+ = 30, 30%+ = 20, 10%+ = 10
-        cond_scale_3 = [
-            df['RATIO'] >= 0.50,
-            df['RATIO'] >= 0.30,
-            df['RATIO'] >= 0.10
-        ]
-        val_scale_3 = 
-        df['SCORE_SCALE_3'] = np.select(cond_scale_3, val_scale_3, default=0)
+        alerts_out_path = os.path.join(out_dir, "alerts_file.csv")
+        audit_out_path = os.path.join(out_dir, "audit_trail_file.csv")
         
-        # =========================================================
-        # Final Score Aggregation
-        # =========================================================
-        logger.info("Aggregating base scales into TOTAL_SCORE...")
+        alerts_file.to_csv(alerts_out_path, index=False)
+        audit_trail_file.to_csv(audit_out_path, index=False)
         
-        # Sum the three primary scales
-        df['TOTAL_SCORE'] = df['SCORE_SCALE_1'] + df['SCORE_SCALE_2'] + df['SCORE_SCALE_3']
-        
-        # Enforce Maximum Score ceiling
-        MAX_SCORE = 9999
-        df['TOTAL_SCORE'] = np.minimum(df['TOTAL_SCORE'], MAX_SCORE)
-        
-        # ---------------------------------------------------------
-        # Output Generation
-        # ---------------------------------------------------------
-        df.to_parquet(os.path.join(pq_dir, "scored_alerts.parquet"), engine='pyarrow')
-        logger.info(f"Step 06 Scoring complete. Successfully evaluated and assigned scores to {len(df)} treated alerts.")
+        logger.info("Output generation complete.")
+        logger.info(f"--> Saved {len(alerts_file)} summary rows to {alerts_out_path}")
+        logger.info(f"--> Saved {len(audit_trail_file)} itemized transaction rows to {audit_out_path}")
         
     except Exception as e:
-        logger.error(f"Failed during alert scoring: {str(e)}", exc_info=True)
+        logger.error(f"Failed during output generation: {str(e)}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
     run()
 ```
+
+### Key Highlights of this Script:
+* **The Alerts File (`alerts_file.csv`)** captures exactly what investigators see at the top level: The `ALERT_ID`, the Account/Party involved, the total scores, and the exact Model Metadata specified in the documentation (Rule: `BNP-RND-EFT-ALL-A-S14-SST`, Alert Type: `10001 [Account Suspicious Activity]`) [1]. 
+* **The Audit Trail File (`audit_trail_file.csv`)** uses Pandas `.explode('TRANSACTION_KEY')` to take the Python list of historical transaction IDs that we grouped during the 14-day rolling window, and splits them into individual rows. 
+* **Relational Traceability:** Both files share the exact same `ALERT_ID`, `CLIENT_NO`, and `ACC_KEY`, allowing you or your stakeholders to perfectly cross-reference an alert's score with the specific transactions that caused it.
