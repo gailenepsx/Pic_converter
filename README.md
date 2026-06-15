@@ -1,12 +1,11 @@
-That is fantastic progress! Reaching 950 valid alerts means the mathematical engine, grouping, and execution scoping are perfectly aligned with your test dataset.
+I apologize for the formatting cut-off in my previous message. The syntax error happened because the arrays assigning the score values (`val_scale_1`, `val_scale_2`, and `val_scale_3`) were left completely empty.
 
-Now, we move to **Component 6: Scoring (`06_scoring.py`)**. 
+Based on the official "Scoring Scales" from the BNP-RND model specifications [1], these are the exact missing values we need to map:
+*   **SCALE 1 (Occurrences):** 10 occurrences = 80 points, 5 occurrences = 40 points, 3 occurrences = 30 points [1].
+*   **SCALE 2 (Total Round Amount Value):** 100,000 = 80 points, 10,000 = 30 points, 3,000 = 10 points [1].
+*   **SCALE 3 (Ratio):** 50% = 30 points, 30% = 20 points, 10% = 10 points [1].
 
-Based on the BNP-RND model specifications, the final score of an alert is the sum of specific scales [1]. This script mathematically applies the thresholds for **SCALE 1** (Occurrences), **SCALE 2** (Total Round Amount Value), and **SCALE 3** (Ratio), and caps the result at the model's absolute maximum score [1, 2]. 
-
-Here is the highly optimized, vectorized scoring component.
-
-### Component 6: Scoring (`06_scoring.py`)
+Here is the fully corrected and complete **Component 6: Scoring (`06_scoring.py`)** script:
 
 ```python
 import pandas as pd
@@ -57,7 +56,6 @@ def run():
         # SCALE 2: Total Round Amount Value
         # =========================================================
         # 100,000+ = 80, 10,000+ = 30, 3,000+ = 10
-        # (Evaluated against the reference currency proxy)
         cond_scale_2 = [
             df['ROUND_VOLUME'] >= 100000,
             df['ROUND_VOLUME'] >= 10000,
@@ -103,8 +101,3 @@ def run():
 if __name__ == "__main__":
     run()
 ```
-
-### Key Alignments with Model Specifications:
-* **Progressive Thresholds:** I utilized `numpy.select` to build the progressive tiering for all three scales efficiently without looping [2]. If a ratio is `0.35` (35%), it will correctly fall through to the second condition and grant 20 points [2].
-* **Euro-Base Scale Mapping:** The specifications note that SCALE 2 is based on threshold values of 3k, 10k, and 100k, and that "scales are in Euro" [2]. By applying these conditions against `ROUND_VOLUME` (which we calculated using `MAIN_CURRENCY_AMT`), the script accurately matches the rule blueprint mapping [1, 3].
-* **Maximum Score Enforcement:** Per the model documentation, the absolute maximum score is capped at `9999` [1]. The script uses `np.minimum` to cleanly enforce this ceiling. *(Note: Standard prior alert scales and High Focus Risk Level CVA scores are external metrics. This engine computes the core detection scores)* [1].
