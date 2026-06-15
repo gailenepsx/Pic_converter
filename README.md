@@ -1,8 +1,8 @@
-Here is the updated **Component 7 (`07_output.py`)** script. 
+To enrich your **Alerts CSV** (`RND_alerts.csv`), we can expand the extracted columns to include the `VALUE_DATE` (which acts as the trigger/observation date for the alert) along with other crucial compliance metadata such as the **Rule ID**, **Alert Type**, **Rule Name**, and the **Total Score**. 
 
-Based on your instructions, we have reversed the traditional contents of the two files: your **Alerts CSV** will now contain the itemized list of hit transactions grouped by the Alert ID, and your **Audit Trail CSV** will serve as the detailed scoring matrix containing the actual values, the assigned scales, and the specific configuration parameters (such as `IGNORE_DECIMALS` [1], Parameter `#105` [2], and Parameter `#80` [3]).
+By adding these fields, every single hit transaction row will now have the complete context of the alert it belongs to, making it much easier for an investigator to review.
 
-### Component 7: Output Generation (`07_output.py`)
+Here is the updated **Component 7 (`07_output.py`)** script with the enhanced Alerts file:
 
 ```python
 import pandas as pd
@@ -17,7 +17,7 @@ def run():
     pq_dir = config['paths']['parquet_dir']
     params = config['model_parameters']
     
-    # Define output directory exactly as requested
+    # Define output directory
     out_dir = './outputs'
     os.makedirs(out_dir, exist_ok=True)
     
@@ -48,14 +48,37 @@ def run():
         # =========================================================
         # STEP 1: Alerts CSV (Itemized Hit Transactions)
         # =========================================================
-        logger.info("Formatting the Alerts file (Hit Transactions)...")
+        logger.info("Formatting the Alerts file (Hit Transactions) with enhanced fields...")
         
-        alerts_columns = ['ALERT_ID', 'CLIENT_NO', 'ACC_KEY', 'TRANSACTION_KEY']
+        # Append official model identifiers to contextualize the hit transactions
+        df['Rule_Id'] = 'BNP-RND-EFT-ALL-A-S14-SST'
+        df['Alert_Type'] = '10001 [Account Suspicious Activity]'
+        df['Rule_Name'] = 'Round Amount Activity'
+        
+        # Enhanced fields for the Alerts file
+        alerts_columns = [
+            'ALERT_ID', 
+            'Rule_Id',
+            'Alert_Type',
+            'Rule_Name',
+            'CLIENT_NO', 
+            'ACC_KEY', 
+            'VALUE_DATE', 
+            'TOTAL_SCORE',
+            'TRANSACTION_KEY'
+        ]
         alerts_file = df[alerts_columns].copy()
         
         # Explode the list so each specific hit transaction gets its own row
-        # This explicitly groups the breached transactions under their unique AlertID
         alerts_file = alerts_file.explode('TRANSACTION_KEY').dropna(subset=['TRANSACTION_KEY'])
+        
+        # Rename columns to be more business-friendly for investigators
+        alerts_file.rename(columns={
+            'CLIENT_NO': 'Party_ID',
+            'ACC_KEY': 'Account_ID',
+            'VALUE_DATE': 'Alert_Observation_Date',
+            'TRANSACTION_KEY': 'Hit_Transaction_ID'
+        }, inplace=True)
         
         # =========================================================
         # STEP 2: Audit Trail CSV (Detailed Scoring & Config)
@@ -64,7 +87,7 @@ def run():
         audit_trail_file = df.copy()
         
         # Retrieve the configuration parameters used during this run.
-        # Fallback to model specification default values if missing from config.json
+        # Fallback to model specification default values if missing from config
         audit_trail_file['IGNORE_DECIMALS'] = params.get('IGNORE_DECIMALS', 1)  
         audit_trail_file['PARAM_105'] = params.get('PARAM_105', 2) 
         audit_trail_file['PARAM_80'] = params.get('PARAM_80', 3)   
@@ -116,8 +139,6 @@ if __name__ == "__main__":
     run()
 ```
 
-### What changed to meet your requirements:
-1. **File Paths & Names:** Both files are now correctly mapped to the `./outputs` folder as `RND_alerts.csv` and `RND_audit_trail.csv`.
-2. **Alerts CSV Design:** I used the Pandas `.explode()` function on `TRANSACTION_KEY` to expand the array. This creates a dedicated row for every single hit transaction while keeping them explicitly bound together by the same unique `AlertID`. 
-3. **Audit Trail CSV Design:** I built a custom dataframe view that perfectly pairs the *Actual Value* calculated during Step 5 with the *Assigned Score* mapped during Step 6 (e.g., `Actual_Total_Round_Amount_Value` next to `SCORE_SCALE_2`).
-4. **Configuration Extraction:** The script pulls the business logic parameters used during the run—like `IGNORE_DECIMALS` [1], `#105` [2], and `#80` [3]—directly from your `params` configuration dictionary and appends them to the audit trail so reviewers can see the exact definition of a "round amount" [1, 2] applied to that specific alert. *(Note: default fallback values of 1, 2, and 3 are coded in to match the documentation defaults if your config file is missing those specific keys [3, 4])* .
+### What was enhanced:
+1.  **Model Metadata Injected:** We mapped the exact rule values from the specifications [1] (`Rule_Id: BNP-RND-EFT-ALL-A-S14-SST`, `Alert_Type: 10001 [Account Suspicious Activity]`, `Rule_Name: Round Amount Activity`) so that every exploded transaction row clearly belongs to the RND model parameters.
+2.  **Added Contextual Fields:** Your `RND_alerts.csv` will now display the `VALUE_DATE` (renamed to `Alert_Observation_Date` for clarity) and `TOTAL_SCORE` next to each specific `Hit_Transaction_ID`. This explicitly bridges the overall alert data with the micro-transaction data.
